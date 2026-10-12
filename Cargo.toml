@@ -1,0 +1,10 @@
+[package]
+name = "vector_search"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ordered-float = "5.5.0"
+rand = "0.10.2"
+rustfft = "6.4.1"
+tokio = { version = "1", features = ["full"] }

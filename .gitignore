@@ -1,0 +1,6 @@
+/target
+*.svg
+*.txt
+*.data*
+*.py
+/db
