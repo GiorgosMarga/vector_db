@@ -1,12 +1,14 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use ordered_float::NotNan;
-
-use crate::memgraph::node;
 
 #[derive(Debug, Clone)]
 pub struct Node {
     pub id: u64,
+    pub vec: Arc<[f32]>,
     pub neighbors: HashMap<u64, BTreeSet<(NotNan<f32>, u64)>>,
 }
 impl Node {

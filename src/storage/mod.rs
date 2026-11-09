@@ -1,4 +1,5 @@
 pub mod engine;
-pub mod graph_store;
+mod page_allocator;
 mod payload_store;
 mod vector_store;
+mod wal;

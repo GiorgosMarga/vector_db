@@ -1,6 +1,7 @@
 use crate::errors::Result;
 use std::{
     fs::{File, OpenOptions},
+    io::Write,
     os::unix::fs::FileExt,
     sync::Arc,
 };

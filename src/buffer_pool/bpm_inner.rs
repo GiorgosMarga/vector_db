@@ -10,8 +10,8 @@ pub struct BufferPoolManagerInner {
     replacer: Replacer,
     frames: Vec<Frame>,
     page_table: HashMap<u64, usize>, // page_id -> frame_id
-    free_list: Vec<usize>,
-    pool_size: usize, // init: [0,1, ... num_frames - 1]
+    free_list: Vec<usize>,           // init: [0,1, ... num_frames - 1]
+    pool_size: usize,
 }
 
 impl BufferPoolManagerInner {
@@ -65,11 +65,12 @@ impl BufferPoolManagerInner {
         let frame = &mut self.frames[frame_id];
         if let Some(old_page_id) = frame.page_id {
             if frame.is_dirty {
-                self.disk_manager.write_page(old_page_id, &frame.data)?;
+                self.disk_manager
+                    .write_page(old_page_id, frame.data.as_ref())?;
             }
             self.page_table.remove(&old_page_id);
         }
-        self.disk_manager.read_page(page_id, &mut frame.data)?;
+        self.disk_manager.read_page(page_id, frame.data.as_mut())?;
 
         frame.page_id = Some(page_id);
         frame.pin_count = 1;
@@ -105,8 +106,11 @@ impl BufferPoolManagerInner {
     pub fn flush_all(&mut self) -> Result<()> {
         for frame in &mut self.frames {
             if frame.is_dirty {
+                if frame.page_id == Some(0) {
+                    println!("flushed header");
+                }
                 if let Some(page_id) = frame.page_id {
-                    self.disk_manager.write_page(page_id, &frame.data)?;
+                    self.disk_manager.write_page(page_id, frame.data.as_ref())?;
                     frame.is_dirty = false;
                 }
             }

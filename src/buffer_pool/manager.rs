@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::{
     buffer_pool::{
         bpm_inner::{self, BufferPoolManagerInner},
-        page_guard::PageGuard,
+        page_guard::PageGuardWrite,
     },
     errors::Result,
 };
@@ -19,17 +19,12 @@ impl BufferPoolManager {
             inner: Arc::new(Mutex::new(bpm)),
         }
     }
-    pub fn fetch_page(&self, page_id: u64) -> Result<PageGuard> {
+    pub fn fetch_page<T>(&self, page_id: u64) -> Result<PageGuardWrite<T>> {
         let mut inner = self.inner.lock().unwrap();
         let frame_id = inner.fetch_frame_page(page_id)?;
-        let data_ptr = inner.get_frame(frame_id).data.as_ptr();
+        let frame = inner.get_frame(frame_id);
 
-        Ok(PageGuard::new(
-            self.inner.clone(),
-            page_id,
-            frame_id,
-            data_ptr,
-        ))
+        Ok(PageGuardWrite::new(self.inner.clone(), frame))
     }
 
     pub fn flush_all(&self) -> Result<()> {

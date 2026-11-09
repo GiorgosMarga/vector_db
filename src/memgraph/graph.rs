@@ -1,21 +1,20 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    sync::atomic::{
-        AtomicU64,
-        Ordering::{self},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    sync::{
+        Arc,
+        atomic::{
+            AtomicU64,
+            Ordering::{self},
+        },
     },
 };
 
 use ordered_float::NotNan;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
-use crate::{
-    errors::Result,
-    memgraph::node::Node,
-    storage::{engine::VectorProvider, graph_store::GraphLogRecord},
-};
+use crate::{errors::Result, memgraph::node::Node};
 
-pub struct HNSW<P> {
+pub struct HNSW {
     entry_point_id: Option<u64>,
     max_layer: u64,
     nodes: HashMap<u64, Node>,
@@ -23,13 +22,18 @@ pub struct HNSW<P> {
     m_max0: usize,          // maximum links allowed at layer 0, 2 * m
     ef_construction: usize, // size of the nearest-neighbors candidate pool during construction
     m_l: f64,               //level probability normalization factor, 1 / ln(m)
-    provider: P,
     latest_id: AtomicU64,
     rng: StdRng,
 }
 
-impl<P> HNSW<P> {
-    pub fn new(provider: P, m: usize, m_max0: usize, ef_construction: usize, m_l: f64) -> Self {
+impl HNSW {
+    pub fn new(
+        m: usize,
+        m_max0: usize,
+        ef_construction: usize,
+        m_l: f64,
+        next_vector_id: u64,
+    ) -> Self {
         Self {
             entry_point_id: None,
             max_layer: 0,
@@ -38,14 +42,13 @@ impl<P> HNSW<P> {
             m_l,
             m,
             ef_construction,
-            provider,
-            latest_id: AtomicU64::new(0),
+            latest_id: AtomicU64::new(next_vector_id),
             rng: rand::rngs::StdRng::seed_from_u64(123),
         }
     }
 }
 
-impl<P: VectorProvider> HNSW<P> {
+impl HNSW {
     fn distance(lhs: &[f32], rhs: &[f32]) -> NotNan<f32> {
         if is_x86_feature_detected!("avx2") {
             unsafe {
@@ -76,10 +79,6 @@ impl<P: VectorProvider> HNSW<P> {
         let r: f64 = self.rng.random();
         (-r.ln() * self.m_l).floor() as u64
     }
-    pub fn provider(&self) -> &P {
-        &self.provider
-    }
-
     pub async fn query(&self, vector: &[f32], k: usize) -> Result<Vec<(NotNan<f32>, u64)>> {
         let Some(mut curr_entry) = self.entry_point_id else {
             return Ok(Vec::new());
@@ -100,13 +99,12 @@ impl<P: VectorProvider> HNSW<P> {
     }
     async fn search_layer_closest(&self, vector: &[f32], node_id: u64, layer: u64) -> Result<u64> {
         let node = self.nodes.get(&node_id).unwrap();
-
         let mut closest_neighbor: u64 = node_id;
-        let neighbor_vec = self.provider.get_vector(node.id).await?;
+        let neighbor_vec = &node.vec;
         let mut closest_distance = Self::distance(vector, &neighbor_vec);
         if let Some(neighbors) = node.neighbors.get(&layer) {
             for neighbor in neighbors {
-                let neighbor_node_vec = self.provider.get_vector(neighbor.1).await?;
+                let neighbor_node_vec = &self.nodes.get(&neighbor.1).unwrap().vec;
                 let distance = Self::distance(vector, &neighbor_node_vec);
                 if distance < closest_distance {
                     closest_distance = distance;
@@ -128,7 +126,7 @@ impl<P: VectorProvider> HNSW<P> {
         let mut results: BTreeSet<(NotNan<f32>, u64)> = BTreeSet::new();
 
         let entry_node = self.nodes.get(&entry).unwrap();
-        let entry_node_vec = self.provider.get_vector(entry_node.id).await?;
+        let entry_node_vec = &entry_node.vec;
         let entry_dist = Self::distance(vector, &entry_node_vec);
 
         candidates.insert((entry_dist, entry));
@@ -146,7 +144,7 @@ impl<P: VectorProvider> HNSW<P> {
                     if !visited.insert(neighbor_id.1) {
                         continue;
                     }
-                    let neighbor_node_vec = self.provider.get_vector(neighbor_id.1).await?;
+                    let neighbor_node_vec = &self.nodes.get(&neighbor_id.1).unwrap().vec;
                     let dist = Self::distance(vector, &neighbor_node_vec);
                     let good_enough =
                         results.len() < self.ef_construction || dist < results.last().unwrap().0;
@@ -163,24 +161,22 @@ impl<P: VectorProvider> HNSW<P> {
         let num_results = if layer == 0 { self.m } else { self.m_max0 };
         Ok(results.into_iter().take(num_results).collect())
     }
-    pub async fn insert(&mut self, node_id: u64, vector: &[f32]) -> Result<Vec<GraphLogRecord>> {
+    pub async fn insert(&mut self, node_id: u64, vector: &[f32]) -> Result<()> {
         // TODO: check whether increase of id should be after insertions
         self.latest_id.fetch_add(1, Ordering::Relaxed);
         let level = self.random_level();
         let mut new_node = Node {
             id: node_id,
             neighbors: HashMap::new(),
+            vec: Arc::from(vector),
         };
-        let mut records = vec![GraphLogRecord::NodeAdded { id: node_id }];
 
         // first node insertion
         if self.entry_point_id.is_none() {
             self.entry_point_id = Some(node_id);
             self.max_layer = level;
             self.nodes.insert(node_id, new_node.clone());
-            records.push(GraphLogRecord::EntryPointSet { id: node_id });
-            records.push(GraphLogRecord::MaxLayerSet { layer: level });
-            return Ok(records);
+            return Ok(());
         }
 
         let mut curr_entry = self.entry_point_id.unwrap();
@@ -200,12 +196,6 @@ impl<P: VectorProvider> HNSW<P> {
                     existing_node.add_neighbor(new_node.id, layer, entry.0, self.m);
                 if connect {
                     new_node.neighbors.entry(layer).or_default().insert(entry);
-                    records.push(GraphLogRecord::InsertEdge {
-                        node_id: new_node.id,
-                        layer,
-                        neighbor_id: entry.1,
-                        distance: entry.0.into_inner(),
-                    });
                 }
 
                 if let Some(evicted_id) = evicted {
@@ -214,11 +204,6 @@ impl<P: VectorProvider> HNSW<P> {
                             let entry = btree.iter().copied().find(|&e| entry.1 == e.1).unwrap();
                             btree.remove(&entry);
                         }))
-                    });
-                    records.push(GraphLogRecord::DeleteEdge {
-                        node_id: entry.1,
-                        layer,
-                        neighbor_id: evicted_id,
                     });
                 }
             }
@@ -234,37 +219,59 @@ impl<P: VectorProvider> HNSW<P> {
         if level > curr_max_layer {
             self.max_layer = level;
             self.entry_point_id = Some(node_id);
-            records.push(GraphLogRecord::EntryPointSet { id: node_id });
-            records.push(GraphLogRecord::MaxLayerSet { layer: level });
         }
-        Ok(records)
+        Ok(())
     }
 
     pub fn get_lateset_id(&self) -> u64 {
         self.latest_id.load(Ordering::Relaxed)
     }
 
-    pub fn insert_nodes(&mut self, nodes: Vec<Node>) -> u64 {
-        for node in nodes {
-            let id = node.id;
-            self.nodes.insert(id, node);
-            self.latest_id.swap(id, Ordering::Relaxed);
+    pub fn collect_bfs_nodes(&self) -> Vec<&Node> {
+        let Some(entry_id) = self.entry_point_id else {
+            return Vec::new();
+        };
+        let mut queue = VecDeque::new();
+        let mut visited = HashSet::new();
+        let mut ordered_nodes = Vec::with_capacity(self.nodes.len());
+
+        queue.push_back(entry_id);
+        visited.insert(entry_id);
+        while let Some(current_id) = queue.pop_front() {
+            if let Some(node) = self.nodes.get(&current_id) {
+                ordered_nodes.push(node);
+                if let Some(neighbors) = node.neighbors.get(&0) {
+                    for &(_, neighbor_id) in neighbors.iter() {
+                        if visited.insert(neighbor_id) {
+                            queue.push_back(neighbor_id);
+                        }
+                    }
+                }
+            }
         }
-        self.latest_id.load(Ordering::Relaxed)
+        for (id, node) in &self.nodes {
+            if visited.insert(*id) {
+                ordered_nodes.push(node);
+            }
+        }
+
+        ordered_nodes
     }
 
     pub fn set_entry_point(&mut self, entry_point: u64) {
         self.entry_point_id = Some(entry_point);
     }
 
+    pub fn get_entry_point(&self) -> Option<u64> {
+        self.entry_point_id
+    }
+
     pub fn set_max_layer(&mut self, max_layer: u64) {
         self.max_layer = max_layer;
     }
 
-    pub fn print(&self) {
-        for node in self.nodes.iter() {
-            println!("{} -> {:?}", node.0, node.1)
-        }
+    pub fn size(&self) -> usize {
+        self.nodes.len()
     }
 }
 

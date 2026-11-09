@@ -1,17 +1,10 @@
-use rustfft::{
-    FftPlanner,
-    num_complex::{Complex32, Complex64},
-};
 use std::{
-    collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
-    time::Instant,
+    time::{Duration, Instant},
 };
-use vector_search::{
-    errors::Result,
-    storage::engine::{self, Engine},
-};
+use tokio::time;
+use vector_search::{errors::Result, storage::engine::Engine};
 
 // TODO: Fix vector ID and file offset handling
 // TODO: Fix and unify distance implementations
@@ -60,7 +53,7 @@ async fn main() -> Result<()> {
     let engine = Engine::new().await?;
     // engine.restore().await?;
 
-    let embeddings = load_glove(&format!("glove.6B.{}d.txt", 300), Some(20000))?;
+    let embeddings = load_glove(&format!("glove.6B.{}d.txt", 300), Some(50_001))?;
     let t0 = Instant::now();
 
     let (word, v) = embeddings.iter().nth(175).unwrap();
@@ -73,6 +66,8 @@ async fn main() -> Result<()> {
     println!("{:?} secs", t0.elapsed().as_secs());
     let res = engine.query(&v).await?;
     println!("{word} -> {res:?}");
+
+    time::sleep(Duration::from_secs(2)).await;
     // let (_d, payload) = engine.get_payload(0).await?;
     // println!("{:?}", String::from_utf8(payload).unwrap());
     Ok(())

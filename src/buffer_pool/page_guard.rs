@@ -1,60 +1,84 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLockWriteGuard};
 
-use crate::buffer_pool::bpm_inner::BufferPoolManagerInner;
+use crate::{
+    buffer_pool::{bpm_inner::BufferPoolManagerInner, frame::Frame},
+    page_allocator::page::Page,
+};
 
-pub struct PageGuard {
+pub const NODE_SIZE: usize = 1466; // Fixed size per node record (aligned to 64 bytes)
+pub const NODES_PER_PAGE: usize = 44; // 42 * 1536 = 64,512 <= 65,536 (64 KB)
+pub const VECTOR_DIMS: usize = 300;
+pub const MAX_NEIGHBORS: usize = 32;
+pub const PAGE_SIZE: usize = 64 * 1024;
+
+/// A write-latched page guard that owns a raw pointer to the frame's data.
+///
+/// Safety: The frame is pinned (pin_count > 0) while this guard exists,
+/// so the underlying memory is stable and won't be evicted.
+///
+/// Field drop order matters here: Rust drops fields in declaration order, so
+/// `_latch` (last) is released AFTER `Drop::drop()` calls `unpin_page`.
+pub struct PageGuardWrite<T> {
     bpm: Arc<Mutex<BufferPoolManagerInner>>,
-    pub page_id: u64,
-    pub frame_id: usize,
-    data_ptr: *const u8,
+    page: Page<T>,
+    page_id: u64,
     is_dirty: bool,
+    // Safety: The underlying RwLock lives in the Frame, which is pinned
+    // (pin_count > 0) for the lifetime of this guard. The lifetime is
+    // transmuted to 'static but is actually tied to the frame's lifetime.
+    // This field MUST be declared last so it is dropped after Drop::drop() runs.
+    _latch: RwLockWriteGuard<'static, ()>,
 }
+
 // Safety: The frame is pinned (pin_count > 0), so the memory is stable
-unsafe impl Send for PageGuard {}
-unsafe impl Sync for PageGuard {}
+unsafe impl<T> Send for PageGuardWrite<T> {}
+unsafe impl<T> Sync for PageGuardWrite<T> {}
 
-impl PageGuard {
-    pub fn new(
-        bpm: Arc<Mutex<BufferPoolManagerInner>>,
-        page_id: u64,
-        frame_id: usize,
-        data_ptr: *const u8,
-    ) -> Self {
+impl<T> PageGuardWrite<T> {
+    /// Create a new write guard from a pinned frame.
+    ///
+    /// # Safety
+    /// The caller must ensure the frame is pinned (pin_count > 0) and
+    /// will remain valid for the lifetime of this guard.
+    pub fn new(bpm: Arc<Mutex<BufferPoolManagerInner>>, frame: &Frame) -> Self {
+        let latch = frame.latch.write().unwrap();
+        // Safety: frame is pinned (pin_count > 0) so the RwLock will not be
+        // deallocated while this guard exists.
+        let latch: RwLockWriteGuard<'static, ()> = unsafe { std::mem::transmute(latch) };
+        let data = frame.data.as_ptr() as *mut u8;
         Self {
-            bpm,
-            page_id,
-            frame_id,
-            data_ptr,
+            page: Page::<T>::new(data),
+            page_id: frame.page_id.unwrap(),
             is_dirty: false,
-        }
-    }
-    pub fn read_data(&self, slot: usize) -> &[f32] {
-        let offset = slot * 1200;
-        // SAFETY:
-        // offset is a multiple of 4, so the pointer is 4-byte aligned for f32.
-        // 1200 bytes = exactly 300 floats.
-        // The slice lifetime is bound to `&self` (the PageGuard).
-        unsafe {
-            let float_ptr = self.data_ptr.add(offset) as *const f32;
-            std::slice::from_raw_parts(float_ptr, 300)
+            bpm,
+            _latch: latch,
         }
     }
 
-    /// Write a 300-dimension vector to slot (0..54)                                                                                                        
-    pub fn write_data(&mut self, slot: usize, vector: &[f32]) {
+    pub fn get_data(&self) -> &[u8; PAGE_SIZE] {
+        self.page.get_data()
+    }
+
+    pub fn get_data_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
         self.is_dirty = true;
-        let offset = slot * 1200;
+        self.page.get_data_mut()
+    }
 
-        unsafe {
-            let dest = self.data_ptr as *mut u8;
-            let dest_slice = std::slice::from_raw_parts_mut(dest.add(offset), 1200);
-            for (i, &val) in vector.iter().enumerate() {
-                dest_slice[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
-            }
-        }
+    pub fn mark_dirty(&mut self) {
+        self.is_dirty = true;
+    }
+
+    pub fn get_page(&self) -> &Page<T> {
+        &self.page
+    }
+
+    pub fn get_page_mut(&mut self) -> &mut Page<T> {
+        self.is_dirty = true;
+        &mut self.page
     }
 }
-impl Drop for PageGuard {
+
+impl<T> Drop for PageGuardWrite<T> {
     fn drop(&mut self) {
         // Automatically decrements pin_count when guard goes out of scope!
         if let Ok(mut bpm) = self.bpm.lock() {

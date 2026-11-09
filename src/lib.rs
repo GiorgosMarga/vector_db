@@ -1,6 +1,7 @@
 pub mod buffer_pool;
 pub mod errors;
 pub mod memgraph;
+pub mod page_allocator;
 pub mod storage;
 
 pub const NUM_OF_COEFF: usize = 150;
